@@ -1,0 +1,147 @@
+From 6f1c6908d8f9278ba0e80c5dd022e503b2283b20 Mon Sep 17 00:00:00 2001
+From: Pasha Khosravi <khosravipasha@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 22:25:28 -0700
+Subject: [PATCH] cuda: FWHT kernels for block widths above 2048 (#152) (#153)
+
+The register kernel keeps N/warp_size floats per thread, so it runs out of
+registers long before the arithmetic runs out: at N=4096 that is 128 floats per
+thread, which spills. The switch therefore stopped at 2048 and returned false
+for anything larger, and the whole op fell back.
+
+The fallback is not free. On an L40S, the two f32 cases at block 4096 fail the
+existing backend-op tolerance through the fallback path:
+
+  MUL_MAT_HADAMARD(blk=4096,width=4096,n_tokens=7)   ERR 1.37e-07 > 1.00e-07
+  MUL_MAT_HADAMARD(blk=4096,width=8192,n_tokens=3)   ERR 1.34e-07 > 1.00e-07
+
+Add a shared-memory path for the widths the register kernel cannot reach: one
+row per block, the row staged in shared memory, all log2(N) butterfly stages run
+there, same sign convention and same scale-and-signs-on-load as the register
+path. 16 KiB of shared at 4096 and 32 KiB at 8192, both inside the 48 KiB
+default, so no opt-in carveout is needed. Blocks up to 2048 keep the existing
+register kernel untouched.
+
+Adds backend-op coverage at 512, 2048, 4096 and 8192 (the previous FWHT cases
+only exercised 1024). On an L40S: 24/26 before, 26/26 after, and the two cases
+that flip are exactly the block-4096 f32 ones above, which also confirms the new
+kernel is what runs rather than the test passing through a CPU fallback.
+
+Co-authored-by: bri-prism <288398250+bri-prism@users.noreply.github.com>
+---
+ ggml/src/ggml-cuda/fwht.cu | 70 ++++++++++++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp | 11 ++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fwht.cu b/ggml/src/ggml-cuda/fwht.cu
+index 844e48cbc..d3140ad59 100644
+--- a/ggml/src/ggml-cuda/fwht.cu
++++ b/ggml/src/ggml-cuda/fwht.cu
+@@ -73,6 +73,59 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
+     }
+ }
+ 
++// Large-N path. The register kernel above keeps N/warp_size floats per thread, so it stops being
++// viable well before the arithmetic does: N=4096 would need 128 registers per thread and spill,
++// which is why the switch below used to end at 2048 and simply decline anything larger (the whole
++// op then fell back to CPU). Stage the row in shared memory instead and run all log2(N) butterfly
++// stages there. One row per block; every thread handles several butterflies per stage. Slower per
++// row than the register path, so it is used only where that path cannot go.
++#define FWHT_SMEM_THREADS 256
++
++template <int N, typename T, bool has_signs>
++__launch_bounds__(FWHT_SMEM_THREADS, 1)
++__global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows, const float scale,
++                               const float * signs, const int n_blk) {
++    __shared__ float s[N];
++
++    const int64_t r = blockIdx.x;
++    if (r >= n_rows) {
++        return;
++    }
++
++    src += r * N;
++    dst += r * N;
++
++    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
++
++    ggml_cuda_pdl_sync();
++    for (int i = threadIdx.x; i < N; i += FWHT_SMEM_THREADS) {
++        float v = fwht_load(src[i]) * scale;
++        if (has_signs) {
++            v *= signs_row[i];
++        }
++        s[i] = v;
++    }
++    __syncthreads();
++
++    // Same butterfly and the same sign convention as the register path: the low element of a pair
++    // takes x + y, the high one x - y.
++#pragma unroll 1
++    for (int h = 1; h < N; h *= 2) {
++        for (int idx = threadIdx.x; idx < N / 2; idx += FWHT_SMEM_THREADS) {
++            const int j = ((idx / h) * 2 * h) + (idx % h);
++            const float x = s[j];
++            const float y = s[j + h];
++            s[j]     = x + y;
++            s[j + h] = x - y;
++        }
++        __syncthreads();
++    }
++
++    for (int i = threadIdx.x; i < N; i += FWHT_SMEM_THREADS) {
++        dst[i] = s[i];
++    }
++}
++
+ template <typename T>
+ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
+                         const int n, const int64_t rows, const float scale,
+@@ -102,6 +155,23 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float
+         FWHT_CASE(1024)
+         FWHT_CASE(2048)
+ #undef FWHT_CASE
++
++    // Beyond 2048 the register path spills, so these run the shared-memory kernel: one row per
++    // block, N floats of shared (16 KiB at 4096, 32 KiB at 8192 -- both inside the 48 KiB default).
++#define FWHT_SMEM_CASE(NN) \
++        case NN: { \
++            const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
++            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
++            if (signs) { \
++                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
++            } else { \
++                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
++            } \
++            return true; \
++        }
++        FWHT_SMEM_CASE(4096)
++        FWHT_SMEM_CASE(8192)
++#undef FWHT_SMEM_CASE
+         default:
+             return false;
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 16e3c74c3..4fee8f143 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9245,6 +9245,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
+     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
++    // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
++    // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
++    // the op fell back, which cost both speed and (measurably) a little accuracy.
++    test_cases.emplace_back(new test_fwht_signed(512,  4096, 7));
++    test_cases.emplace_back(new test_fwht_signed(512,  8192, 3));
++    test_cases.emplace_back(new test_fwht_signed(2048, 4096, 7));
++    test_cases.emplace_back(new test_fwht_signed(2048, 8192, 3));
++    test_cases.emplace_back(new test_fwht_signed(4096, 4096, 7));
++    test_cases.emplace_back(new test_fwht_signed(4096, 8192, 3));
++    test_cases.emplace_back(new test_fwht_signed(4096, 8192, 1,  GGML_TYPE_F16));
++    test_cases.emplace_back(new test_fwht_signed(8192, 8192, 2));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
+ 
+ #if 0
+-- 
+2.55.0
+

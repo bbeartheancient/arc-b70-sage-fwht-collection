@@ -1,0 +1,46 @@
+From a7bc57150bf29f15de3c7534726d9c20ff544740 Mon Sep 17 00:00:00 2001
+From: opencode <opencode@local>
+Date: Sat, 26 Sep 2026 19:56:36 -0500
+Subject: [PATCH] sycl: serve block_size 1024 in the Hadamard fast path
+
+llama_mul_mat_hadamard() reshapes the activation to [block_size, K] and
+multiplies it by a block_size x block_size rot, so every MUL_MAT tagged
+GGML_HINT_SRC0_IS_HADAMARD by prism.hadamard folding presents n == block_size.
+The switch only covered 64/128/256/512, which are the KV-cache sizes, so
+block_size 1024 fell through to a dense matmul against a 4 MiB rot tensor
+that was re-read and re-multiplied per folded weight.
+
+Sylvester H is symmetric, so the register-resident FWHT already used for the
+smaller sizes computes exactly rot^T * res; the existing 1/sqrt(n) at load
+gives 1/32 at n=1024. No new code path, one case.
+
+Measured on Arc Pro B70, Ternary-Bonsai-2-27B-PTQ1_0, 256-token decode,
+median of 3: 25.04 -> 26.27 tok/s, arithmetic canary exact.
+---
+ ggml/src/ggml-sycl/fwht.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/fwht.cpp b/ggml/src/ggml-sycl/fwht.cpp
+index 2312b3d13..6e5374421 100644
+--- a/ggml/src/ggml-sycl/fwht.cpp
++++ b/ggml/src/ggml-sycl/fwht.cpp
+@@ -113,6 +113,16 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
+         case 512:
+             launch_fwht<512>(src_d, dst_d, rows, scale, stream);
+             return true;
++        // Ternary-Bonsai weight rotation. llama_mul_mat_hadamard() reshapes the
++        // activation to [block_size, K] and multiplies it by a block_size x
++        // block_size rot, so a hinted MUL_MAT from prism.hadamard folding always
++        // presents n == block_size. At block_size 1024 the 4 MiB rot tensor is
++        // otherwise re-read and re-multiplied as a dense matmul per folded weight.
++        // Sylvester H is symmetric, so the FWHT result is bit-comparable to
++        // rot^T * res up to the same 1/sqrt(n) the smaller cases already apply.
++        case 1024:
++            launch_fwht<1024>(src_d, dst_d, rows, scale, stream);
++            return true;
+         default:
+             return false;
+     }
+-- 
+2.55.0
+

@@ -1,0 +1,340 @@
+From ca02f9b8338c79d3a49283b6d745f91b39a8ee9e Mon Sep 17 00:00:00 2001
+From: bri-prism <288398250+bri-prism@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 13:15:03 -0700
+Subject: [PATCH] metal, vulkan: FWHT kernels for wide block widths (to prism)
+ (#155)
+
+* metal: FWHT kernels for block widths above 2048
+
+The register-resident kernel keeps N/32 values per thread, so it stops
+fitting at N=4096. Add a threadgroup-staged variant that maps one row to a
+whole threadgroup: butterflies below the simdgroup width still shuffle,
+those up to the threadgroup size exchange through threadgroup memory, and
+the remainder stay in registers. Instantiate it at 4096 and 8192 under the
+existing kernel_fwht_<type>_<n> names so the host lookup is unchanged.
+
+* vulkan: FWHT kernels for block widths above 512
+
+Vulkan stopped at 512 while CUDA and Metal now go to 8192. Extend the width
+list to 8192 and pick the shader shape per width: the subgroup shader keeps
+n/subgroup_size values per invocation so it stays on widths up to 2048, and
+wider blocks use the shared-memory shader with one row per workgroup, which
+keeps the register block small and the staging buffer at n floats. Rows per
+workgroup becomes a specialization constant instead of a hardcoded 4, and the
+value chosen at build time is recorded so the dispatch agrees with it. Widths
+that would exceed maxComputeSharedMemorySize or maxComputeWorkGroupInvocations
+leave a null pipeline, which already makes ggml_vk_can_use_fwht fall back.
+
+* vulkan: key the FWHT subgroup cutoff on the register block
+
+The subgroup shader pins BLOCK_SIZE to the subgroup width, so its register
+block is n/subgroup_size rather than n/32. A width cutoff alone therefore
+still admits the register wall on a device reporting a narrow subgroup: at
+subgroup_size 16 a 2048 block is 128 values per invocation. Cut over on the
+ratio as well as the width, which is a no-op on the 32 and 64 wide subgroups
+and routes the narrow ones to the shared-memory shader.
+---
+ ggml/src/ggml-metal/ggml-metal-device.h       |  2 +-
+ ggml/src/ggml-metal/ggml-metal-impl.h         |  5 ++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp        |  7 ++
+ ggml/src/ggml-metal/kernels/misc.metal        | 77 +++++++++++++++++++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 68 +++++++++++-----
+ ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp |  5 +-
+ tests/test-backend-ops.cpp                    |  1 +
+ 7 files changed, 141 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 46708c020..5d6809025 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -148,7 +148,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht
+ // FWHT block widths with dedicated Metal kernels; the Hadamard matmul hint
+ // falls back to a plain mul_mat for other widths, which has no F16-input pipeline.
+ static inline bool ggml_metal_fwht_supported_size(int64_t n) {
+-    return n == 64 || n == 128 || n == 256 || n == 512 || n == 1024 || n == 2048;
++    return n == 64 || n == 128 || n == 256 || n == 512 || n == 1024 || n == 2048 || n == 4096 || n == 8192;
+ }
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 1151e5099..01562df57 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1204,6 +1204,11 @@ typedef struct {
+     int32_t  len;
+ } ggml_metal_kargs_argsort_merge;
+ 
++// Block widths at or above this run the threadgroup-staged FWHT kernel: the
++// register-resident one keeps N/32 values per thread, which stops fitting here.
++#define GGML_METAL_FWHT_TG_MIN_N 4096
++#define GGML_METAL_FWHT_TG_NT    256
++
+ typedef struct {
+     int32_t nrows;
+ } ggml_metal_kargs_fwht;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 38744c2d3..33bcd7622 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2444,6 +2444,13 @@ int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
+     const int th_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+     const int simd_size = 32;
+ 
++    if (n >= GGML_METAL_FWHT_TG_MIN_N) {
++        GGML_ASSERT(th_max >= GGML_METAL_FWHT_TG_NT);
++        ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, GGML_METAL_FWHT_TG_NT, 1, 1);
++
++        return 1;
++    }
++
+     int sg_per_tg = 2;
+     sg_per_tg = std::min(sg_per_tg, th_max/simd_size);
+     sg_per_tg = std::max(sg_per_tg, 1);
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 761610b6a..0805d9b26 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -429,6 +429,79 @@ kernel void kernel_fwht(
+     }
+ }
+ 
++// Wide blocks: one row per threadgroup instead of per simdgroup, so each thread
++// keeps N/NT values rather than N/32. Butterflies below the simdgroup width still
++// shuffle; those up to NT go through threadgroup memory; the rest stay in registers.
++template<int N, int NT, typename src_t>
++kernel void kernel_fwht_tg(
++        constant ggml_metal_kargs_fwht & args,
++        device const src_t * src,
++        device float * dst,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort3  ntg[[threads_per_threadgroup]]) {
++
++    constexpr int NW = N_SIMDWIDTH;
++    constexpr int NE = N / NT;
++
++    threadgroup float shmem[N];
++
++    const float scale = 1.0f / sqrt((float) N);
++
++    const int64_t r = tgpig.x;
++    if (r >= args.nrows) {
++        return;
++    }
++
++    src += r * N;
++    dst += r * N;
++
++    const int tid = sgitg * NW + tiisg;
++
++    float reg[NE];
++    for (int i = 0; i < NE; i++) {
++        reg[i] = float(src[i*NT + tid])*scale;
++    }
++
++    for (int i = 1; i < NW; i *= 2) {
++        for (int j = 0; j < NE; j++) {
++            const float val  = reg[j];
++            const float val2 = simd_shuffle_xor(val, i);
++            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
++        }
++    }
++
++    for (int i = NW; i < NT; i *= 2) {
++        for (int j = 0; j < NE; j++) {
++            shmem[j*NT + tid] = reg[j];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int j = 0; j < NE; j++) {
++            const float val  = reg[j];
++            const float val2 = shmem[j*NT + (tid ^ i)];
++            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    for (int i = NT; i < N; i *= 2) {
++        const int step = i / NT;
++        for (int j = 0; j < NE; j += (2 * step)) {
++            for (int k = 0; k < step; k++) {
++                const float x = reg[j + k ];
++                const float y = reg[j + k + step];
++                reg[j + k]        = x + y;
++                reg[j + k + step] = x - y;
++            }
++        }
++    }
++
++    for (int i = 0; i < NE; i++) {
++        dst[i*NT + tid] = reg[i];
++    }
++}
++
+ typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;
+ typedef decltype(kernel_fwht<64, half>)  kernel_fwht_f16_t;
+ 
+@@ -444,6 +517,10 @@ template [[host_name("kernel_fwht_f16_256")]]  kernel kernel_fwht_f16_t kernel_f
+ template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht<512, half>;
+ template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_fwht<1024, half>;
+ template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht<2048, half>;
++template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
++template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
++template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
++template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+ 
+ kernel void kernel_dsv4_hc_comb_f32(
+         constant ggml_metal_kargs_dsv4_hc_comb & args,
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e30fb0d63..b6f9965ad 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -768,6 +768,16 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
+ };
+ 
+ 
++// FWHT block widths with a dedicated Vulkan pipeline. The subgroup shader pins its
++// block to the subgroup width, so it keeps n/subgroup_size values per invocation;
++// widths that push that past GGML_VK_FWHT_MAX_SUBGROUP_EL_W stage through shared
++// memory instead. The cutoff has to key on that ratio and not on n alone, because a
++// device reporting a narrow subgroup reaches the same register wall at a smaller n.
++static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES         = 8;
++static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
++static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
++static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
++
+ struct vk_device_struct {
+     std::recursive_mutex mutex;
+     mutable std::shared_mutex pinned_memory_mutex;
+@@ -1042,8 +1052,10 @@ struct vk_device_struct {
+     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
+     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
+     vk_pipeline pipeline_sum_rows_f32;
+-    vk_pipeline pipeline_fwht_f32[4];
+-    vk_pipeline pipeline_fwht_f16[4];
++    vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
++    vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
++    // rows a workgroup covers, chosen per width when the pipeline is built
++    uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
+     vk_pipeline pipeline_cumsum_f32;
+     vk_pipeline pipeline_cumsum_small_f32;
+     vk_pipeline pipeline_cumsum_multipass1_f32;
+@@ -5779,25 +5791,33 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     // Intel Windows driver in range [32.0.101.8509, 32.0.101.8860) will crash when using fwht kernels so we gate that here
+     const bool can_use_fwht = device->driver_id != vk::DriverId::eIntelProprietaryWindows ||
+         !ggml_vk_intel_windows_driver_in_range(device->properties.driverVersion, 101, 8509, 101, 8860);
+-    if (can_use_fwht && device->subgroup_basic && device->subgroup_shuffle) {
+-        int idx = 0;
+-        for (uint32_t n : {64, 128, 256, 512}) {
+-            if (device->subgroup_size <= n) {
+-            ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
+-            // the f16 shader needs shader-float16; a null pipeline makes ggml_vk_can_use_fwht fall back
+-            if (device->fp16) {
+-                ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
+-            }
+-            }
+-            ++idx;
+-        }
+-    } else if (can_use_fwht) {
++    if (can_use_fwht) {
++        const bool use_subgroup = device->subgroup_basic && device->subgroup_shuffle;
+         int idx = 0;
+-        for (uint32_t n : {64, 128, 256, 512}) {
+-            const uint32_t block_size = std::min(device->subgroup_size, n);
+-            ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
+-            if (device->fp16) {
+-                ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_shmem_f16", fwht_shmem_f16_len, fwht_shmem_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
++        const uint32_t sg = std::max(device->subgroup_size, 1u);
++        for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
++            const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
++            if (use_subgroup && !wide) {
++                if (device->subgroup_size <= n) {
++                    ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
++                    // the f16 shader needs shader-float16; a null pipeline makes ggml_vk_can_use_fwht fall back
++                    if (device->fp16) {
++                        ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
++                    }
++                    device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
++                }
++            } else {
++                // wide blocks trade rows per workgroup for a smaller register block
++                const uint32_t block_size = wide ? std::min(n, 256u) : std::min(sg, n);
++                const uint32_t rows       = wide ? 1u : GGML_VK_FWHT_ROWS;
++                if ((uint64_t)rows * n * sizeof(float) <= device->properties.limits.maxComputeSharedMemorySize &&
++                    block_size * rows <= device->properties.limits.maxComputeWorkGroupInvocations) {
++                    ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                    if (device->fp16) {
++                        ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_shmem_f16", fwht_shmem_f16_len, fwht_shmem_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
++                    }
++                    device->fwht_rows_per_wg[idx] = rows;
++                }
+             }
+             ++idx;
+         }
+@@ -9986,12 +10006,17 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
+         }, pc, { (uint32_t)ne03, (uint32_t)ne01, (uint32_t)ne12 });
+ }
+ 
++// keep in sync with the width list in ggml_vk_load_shaders and GGML_VK_FWHT_NUM_SIZES
+ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
+     switch (n) {
+         case 64:  return 0;
+         case 128: return 1;
+         case 256: return 2;
+         case 512: return 3;
++        case 1024: return 4;
++        case 2048: return 5;
++        case 4096: return 6;
++        case 8192: return 7;
+         default:  return -1;
+     }
+ }
+@@ -10027,7 +10052,8 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
+     vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
+ 
+-    const uint32_t rows_per_workgroup = 4;
++    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
++    GGML_ASSERT(rows_per_workgroup > 0);
+     const uint32_t n_rows = (uint32_t)ggml_nrows(src);
+     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+index d53ef81ae..904c89817 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fwht.comp
+@@ -11,8 +11,9 @@
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+ layout(constant_id = 1) const uint N = 128;
++layout(constant_id = 2) const uint ROWS = 4;
+ 
+-layout(local_size_x_id = 0, local_size_y = 4, local_size_z = 1) in;
++layout(local_size_x_id = 0, local_size_y_id = 2, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform parameter
+ {
+@@ -34,7 +35,7 @@ layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+ const uint EL_W = N / BLOCK_SIZE;
+ 
+ #ifdef FWHT_SHMEM
+-shared float shmem[4 * N];
++shared float shmem[ROWS * N];
+ #endif
+ 
+ void main() {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4fee8f143..2084fc67d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9256,6 +9256,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_fwht_signed(4096, 8192, 3));
+     test_cases.emplace_back(new test_fwht_signed(4096, 8192, 1,  GGML_TYPE_F16));
+     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 2));
++    test_cases.emplace_back(new test_fwht_signed(8192, 8192, 1,  GGML_TYPE_F16));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
+ 
+ #if 0
+-- 
+2.55.0
+
